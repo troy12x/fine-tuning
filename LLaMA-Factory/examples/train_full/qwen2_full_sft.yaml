@@ -12,6 +12,7 @@ dataset: Sky-T1
 template: qwen25
 cutoff_len: 20671
 max_samples: 1000000
+max_steps: 6000
 overwrite_cache: true
 preprocessing_num_workers: 16
 
@@ -23,22 +24,18 @@ plot_loss: true
 
 ### train
 # Optimized for 4 GPUs
-per_device_train_batch_size: 2  # Increased from 1
-gradient_accumulation_steps: 8  # Adjusted for new batch size (total batch = 2*4*8 = 64)
-learning_rate: 1.0e-5
+per_device_train_batch_size: 4  # Increased from 1
+gradient_accumulation_steps: 4  # Adjusted for new batch size (total batch = 2*4*8 = 64)
+learning_rate: 3e-6
 num_train_epochs: 3.0
 lr_scheduler_type: cosine
 warmup_ratio: 0.1
 bf16: true
 ddp_timeout: 180000000
-gradient_checkpointing: true
-use_flash_attention: true
 
-# Multi-GPU specific settings
-ddp_find_unused_parameters: false
-ddp_broadcast_buffers: false
-local_rank: -1
-tf32: true
+
+
+
 
 report_to: wandb
 run_name: Sky-T1-4GPU
