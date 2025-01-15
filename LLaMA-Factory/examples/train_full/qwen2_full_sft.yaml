@@ -25,7 +25,7 @@ plot_loss: true
 per_device_train_batch_size: 4  # Increased from 1
 gradient_accumulation_steps: 4  # Adjusted for new batch size (total batch = 2*4*8 = 64)
 learning_rate: 3e-6
-num_train_epochs: 3.0
+num_train_epochs: 5.0
 lr_scheduler_type: cosine
 warmup_ratio: 0.1
 bf16: true
