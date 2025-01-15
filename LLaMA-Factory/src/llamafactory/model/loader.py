@@ -39,7 +39,7 @@ from .model_utils.mod import convert_pretrained_model_to_mod, load_mod_pretraine
 from .model_utils.unsloth import load_unsloth_pretrained_model
 from .model_utils.valuehead import load_valuehead_params
 from .patcher import patch_config, patch_model, patch_processor, patch_tokenizer, patch_valuehead_model
-
+import torch.nn as nn
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizer, ProcessorMixin
@@ -182,16 +182,34 @@ def load_model(
             if not hasattr(model, "dtat_adapter"):
                 model.dtat_adapter = DTATAdapter(model.config)
                 model._original_forward = model.forward
+                model._input_proj = nn.Linear(152064, model.config.hidden_size).to(
+                    device=next(model.parameters()).device,
+                    dtype=next(model.parameters()).dtype
+                )
                 
-                def new_forward(*args, **kwargs):
-                    outputs = model._original_forward(*args, **kwargs)
+                def new_forward(self, *args, **kwargs):
+                    # Extract input_ids from args if present
+                    if args and isinstance(args[0], torch.Tensor):
+                        kwargs['input_ids'] = args[0]
+                        args = args[1:]
+                    
+                    outputs = self._original_forward(**kwargs)
                     if isinstance(outputs, dict):
                         hidden_states = outputs.get("hidden_states", outputs.get("logits"))
                         if hidden_states is not None:
-                            outputs["logits"] = model.dtat_adapter(hidden_states)
+                            # Project to correct dimension before DTAT
+                            if hidden_states.size(-1) != self.config.hidden_size:
+                                hidden_states = self._input_proj(hidden_states)
+                            # Process through DTAT adapter
+                            dtat_output = self.dtat_adapter(hidden_states)
+                            outputs["logits"] = dtat_output
                     else:
                         hidden_states = outputs[0] if isinstance(outputs, tuple) else outputs
-                        enhanced = model.dtat_adapter(hidden_states)
+                        # Project to correct dimension before DTAT
+                        if hidden_states.size(-1) != self.config.hidden_size:
+                            hidden_states = self._input_proj(hidden_states)
+                        # Process through DTAT adapter
+                        enhanced = self.dtat_adapter(hidden_states)
                         if isinstance(outputs, tuple):
                             outputs = (enhanced,) + outputs[1:]
                         else:

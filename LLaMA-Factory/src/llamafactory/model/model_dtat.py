@@ -13,15 +13,19 @@ class ContextProcessor(nn.Module):
                 in_channels=config.hidden_size, 
                 out_channels=config.hidden_size // 4,
                 kernel_size=2**i + 1,
-                padding='same',  # Use 'same' padding to maintain sequence length
+                padding='same',
                 stride=1
             ) for i in range(4)
         ])
         
+        # Projection layers for dimension matching
+        self.input_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.combined_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        
         # Cross-scale attention for feature interaction
         self.cross_attention = nn.MultiheadAttention(
             embed_dim=config.hidden_size,
-            num_heads=8,  # Use 8 heads since it divides 896
+            num_heads=8,
             dropout=0.1,
             batch_first=True
         )
@@ -30,7 +34,7 @@ class ContextProcessor(nn.Module):
         self.fusion = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.norm = nn.LayerNorm(config.hidden_size)
         
-        # Temperature prediction (now outputs hidden_size dimension)
+        # Temperature prediction
         self.temp_net = nn.Sequential(
             nn.Linear(config.hidden_size * 2, config.hidden_size // 2),
             nn.GELU(),
@@ -52,13 +56,19 @@ class ContextProcessor(nn.Module):
     def forward(self, x):
         B, T, C = x.size()
         
+        # Project input to hidden size if needed
+        if C != self.conv_scales[0].in_channels:
+            x = self.input_proj(x)
+            C = self.conv_scales[0].in_channels
+        
         # Process at multiple scales
         multi_scale = []
         x_conv = x.transpose(1, 2)  # [B, C, T]
         
-        # Ensure conv layers are on same device as input
-        if next(self.conv_scales.parameters()).device != x.device:
-            self.conv_scales = self.conv_scales.to(device=x.device)
+        # Ensure all components are on correct device and dtype
+        if (next(self.conv_scales.parameters()).device != x.device or 
+            next(self.conv_scales.parameters()).dtype != x.dtype):
+            self.to(device=x.device, dtype=x.dtype)
         
         for conv in self.conv_scales:
             # Apply convolution and ensure output size matches input
@@ -71,8 +81,11 @@ class ContextProcessor(nn.Module):
             multi_scale.append(scale_feat)
         
         # Combine scales and reshape back
-        combined = torch.cat(multi_scale, dim=1)  # [B, C*4, T]
-        combined = combined.transpose(1, 2)  # [B, T, C*4]
+        combined = torch.cat(multi_scale, dim=1)  # [B, C, T]
+        combined = combined.transpose(1, 2)  # [B, T, C]
+        
+        # Project combined features to match embedding dimension
+        combined = self.combined_proj(combined)
         
         # Cross-scale attention
         attn_out, _ = self.cross_attention(x, combined, combined)
@@ -81,11 +94,10 @@ class ContextProcessor(nn.Module):
         fused = self.fusion(torch.cat([x, attn_out], dim=-1))
         enhanced = self.norm(fused)
         
-        # Predict temperatures with scale information (now same size as hidden_states)
+        # Predict temperatures with scale information
         temps = F.softplus(self.temp_net(torch.cat([enhanced, attn_out], dim=-1))) + 0.5
         
-        return enhanced, temps
-
+        return enhanced
 
 class RotaryPositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_seq_length=2048):
@@ -145,36 +157,38 @@ class MultiScaleTemperature(nn.Module):
         temps = torch.sigmoid(self.temp_proj(combined))
         return temps
 
-class TokenClusterProcessor(nn.Module):
+class TokenImportance(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.d_model = config.hidden_size
-        self.num_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
         
-        # Projections for attention-based clustering
-        self.q_proj = nn.Linear(self.d_model, self.d_model)
-        self.k_proj = nn.Linear(self.d_model, self.d_model)
-        self.v_proj = nn.Linear(self.d_model, self.d_model)
+        # Input projection
+        self.input_proj = nn.Linear(config.hidden_size, config.hidden_size)
         
-        self.scale = self.d_model ** -0.5
+        # Token importance scoring
+        self.score_net = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size // 2),
+            nn.GELU(),
+            nn.Linear(config.hidden_size // 2, config.hidden_size)
+        )
         
-    def forward(self, x, mask=None):
-        # Project to Q, K, V
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        self.norm = nn.LayerNorm(config.hidden_size)
         
-        # Compute attention scores
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        # Move to correct dtype if specified
+        if hasattr(config, 'torch_dtype'):
+            self.to(dtype=config.torch_dtype)
+    
+    def forward(self, x, memory=None):
+        # Project input if needed
+        if x.size(-1) != self.hidden_size:
+            x = self.input_proj(x)
         
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
+        # Calculate importance scores
+        scores = self.score_net(x)
+        enhanced = x * F.sigmoid(scores)
+        output = self.norm(enhanced)
         
-        # Get attention weights and weighted values
-        weights = F.softmax(scores, dim=-1)
-        clustered = torch.matmul(weights, v)
-        
-        return clustered, weights
+        return output
 
 class OptimalPathSelector(nn.Module):
     def __init__(self, config):
@@ -280,50 +294,40 @@ class GuidedReasoning(nn.Module):
         return expanded
 
     def forward(self, hidden_states):
-        batch_size, seq_length = hidden_states.size()[:2]
+        batch_size, seq_len, hidden_size = hidden_states.size()
         
-        # Process each reasoning level
+        # Process through multiple reasoning levels
         level_outputs = []
-        temperatures = []
+        current_hidden = hidden_states
         
-        current_state = hidden_states
-        for level, (ratio, reasoning_layer, memory_attn, gate, temp_net) in enumerate(zip(
-            self.compression_ratios, self.reasoning_levels, self.memory_attention, 
-            self.level_gates, self.temp_nets)):
+        for i, (reasoning_layer, memory_attn, gate) in enumerate(zip(
+            self.reasoning_levels, self.memory_attention, self.level_gates)):
             
-            # Compress sequence for this level
-            compressed = self.compress_sequence(current_state, ratio)
+            # Compress sequence for efficiency
+            compressed = self.compress_sequence(current_hidden, self.compression_ratios[i])
             
             # Apply reasoning transformation
             reasoned = reasoning_layer(compressed)
             
-            # Memory attention at compressed length
-            mem_out, _ = memory_attn(reasoned, reasoned, reasoned)
+            # Memory attention
+            memory_out, _ = memory_attn(reasoned, reasoned, reasoned)
             
-            # Expand back to original length
-            expanded = self.expand_sequence(mem_out, seq_length)
+            # Expand back to original sequence length
+            expanded = self.expand_sequence(memory_out, seq_len)
             
-            # Calculate gate value and apply
+            # Gate the output
             gate_value = gate(expanded)
             gated_output = expanded * gate_value
             
-            # Temperature prediction
-            temps = F.softplus(temp_net(torch.cat([expanded, gated_output], dim=-1))) + 0.5
-            
             level_outputs.append(gated_output)
-            temperatures.append(temps)
-            
-            # Update current state with gated output
-            current_state = gated_output
+            current_hidden = gated_output
         
-        # Combine gated outputs from all levels
-        combined_output = torch.cat(level_outputs, dim=-1)
-        final_output = self.norm(self.final_fusion(combined_output))
+        # Combine all level outputs
+        combined = torch.cat(level_outputs, dim=-1)
+        output = self.final_fusion(combined)
+        output = self.norm(output)
         
-        # Average temperatures
-        final_temps = torch.stack(temperatures).mean(dim=0)
-        
-        return final_output, final_temps
+        return output
 
 class EnhancedTokenImportance(nn.Module):
     def __init__(self, config):
@@ -379,7 +383,7 @@ class EnhancedTokenImportance(nn.Module):
                     if layer.bias is not None:
                         nn.init.zeros_(layer.bias)
 
-    def forward(self, x, freq_indices=None, positions=None):
+    def forward(self, x, freq_indices=None, positions=None, memory=None):
         batch_size = x.size(0)
         
         # Normalize input
@@ -387,31 +391,29 @@ class EnhancedTokenImportance(nn.Module):
         
         # Query memory bank
         memory = self.memory.expand(batch_size, -1, -1)
-        mem_out, _ = self.memory_attention(x, memory, memory)
+        mem_out = self.memory_attention(x, memory, memory)[0]  # Only take attention output
         
         # Process with enhanced components
-        context_out, context_temps = self.context_processor(x)
-        reasoning_out, reasoning_temps = self.guided_reasoning(x)
+        context_out = self.context_processor(x)
+        reasoning_out = self.guided_reasoning(x)
+        importance_out = self.token_importance(x, memory=memory)
         
         # Apply rotary embeddings if positions provided
         if positions is not None:
             x = self.rope(x)
-        
-        # Clear intermediate memory
-        torch.cuda.empty_cache()
+            mem_out = self.rope(mem_out)
         
         # Combine all features
         combined = torch.cat([
             x,
-            context_out * context_temps,  # Now matches hidden_size
-            reasoning_out * reasoning_temps,  # Now matches hidden_size
+            context_out,
+            reasoning_out,
+            importance_out,
             mem_out
         ], dim=-1)
         
         # Compute importance scores with memory context
-        importance = self.importance_net(
-            torch.cat([x, mem_out], dim=-1)
-        ).squeeze(-1)  # [B, T]
+        importance = self.importance_net(torch.cat([x, mem_out], dim=-1)).squeeze(-1)  # [B, T]
         
         # Apply sigmoid to get scores between 0 and 1
         importance = torch.sigmoid(importance)
@@ -419,22 +421,10 @@ class EnhancedTokenImportance(nn.Module):
         # Final fusion with all components
         fused = self.fusion(combined)  # [B, T, H]
         
-        # Clear intermediate memory
-        torch.cuda.empty_cache()
+        # Apply importance weighting
+        output = fused * importance.unsqueeze(-1)
         
-        # Return with complete stats for monitoring
-        stats = {
-            'memory_attention': mem_out.mean().item(),
-            'importance_scores': importance.mean().item(),
-            'context_temps': context_temps.mean().item(),
-            'reasoning_temps': reasoning_temps.mean().item(),
-            'reasoning_stats': {
-                'output_mean': reasoning_out.mean().item(),
-                'temp_mean': reasoning_temps.mean().item()
-            }
-        }
-        
-        return importance, fused, stats
+        return output
 
 class SparseDenseAttention(nn.Module):
     """
@@ -711,8 +701,8 @@ class DTATTransformer(nn.Module):
         x = self.drop(tok_emb)
         
         # Get importance scores and temperatures
-        importance_scores, temperatures, reasoning_stats = self.importance(x, freq_indices, positions)
-        if check_nan(importance_scores, "importance_scores") or check_nan(temperatures, "temperatures"):
+        importance_scores = self.importance(x, freq_indices, positions)
+        if check_nan(importance_scores, "importance_scores"):
             return None, float('nan'), {}
         
         # Apply transformer blocks with gradient checkpointing if enabled
@@ -722,14 +712,13 @@ class DTATTransformer(nn.Module):
                     block,
                     x,
                     importance_scores,
-                    temperatures,
                     use_reentrant=False
                 )
                 if check_nan(x, f"block {i} output"):
                     return None, float('nan'), {}
         else:
             for i, block in enumerate(self.blocks):
-                x = block(x, importance_scores, temperatures)
+                x = block(x, importance_scores)
                 if check_nan(x, f"block {i} output"):
                     return None, float('nan'), {}
         
@@ -775,11 +764,7 @@ class DTATTransformer(nn.Module):
             if check_nan(loss, "final loss"):
                 return None, float('nan'), {}
         
-        return logits, loss, {
-            'importance_scores': importance_scores,
-            'temperatures': temperatures,
-            'reasoning_stats': reasoning_stats
-        }
+        return logits, loss, {}
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
@@ -818,30 +803,43 @@ class DTATAdapter(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
         
+        # Input projection layers
+        self.input_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.pre_adapter_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        
         # Initialize components
         self.context_processor = ContextProcessor(config)
         self.guided_reasoning = GuidedReasoning(config)
         self.token_importance = EnhancedTokenImportance(config)
         
+        # Component projections
+        self.context_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.reasoning_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.importance_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        
         # Multi-head attention with proper scaling
-        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         
         # Initialize with small weights
-        for proj in [self.q_proj, self.k_proj, self.v_proj, self.o_proj]:
+        for proj in [self.q_proj, self.k_proj, self.v_proj, self.o_proj,
+                    self.context_proj, self.reasoning_proj, self.importance_proj,
+                    self.input_proj, self.pre_adapter_proj]:
             nn.init.normal_(proj.weight, mean=0.0, std=0.02)
+            if proj.bias is not None:
+                nn.init.zeros_(proj.bias)
         
         # Feature fusion
-        self.feature_fusion = nn.Linear(self.hidden_size * 4, self.hidden_size, bias=False)
-        self.final_fusion = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=False)
+        self.feature_fusion = nn.Linear(config.hidden_size * 4, config.hidden_size, bias=False)
+        self.final_fusion = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
         
         with torch.no_grad():
             torch.nn.init.xavier_uniform_(self.feature_fusion.weight, gain=0.02)
             torch.nn.init.xavier_uniform_(self.final_fusion.weight, gain=0.02)
         
-        self.layer_norm = nn.LayerNorm(self.hidden_size, eps=1e-5)
+        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=1e-5)
         self.scale = nn.Parameter(torch.ones(1) * 0.01)
         self.dropout = nn.Dropout(0.1)
         
@@ -851,76 +849,66 @@ class DTATAdapter(nn.Module):
             torch.sqrt(torch.tensor(self.head_dim, dtype=torch.float32)).reciprocal()
         )
         
-        # Move to correct dtype if specified
+        # Move all components to specified dtype if provided
         if hasattr(config, 'torch_dtype'):
-            self.to(dtype=config.torch_dtype)
+            dtype = getattr(config, 'torch_dtype')
+            self.to(dtype=dtype)
+            # Ensure buffers are also in correct dtype
+            for name, buffer in self.named_buffers():
+                if buffer.dtype != dtype:
+                    self.register_buffer(name, buffer.to(dtype=dtype))
 
-    def forward(self, hidden_states):
-        # Ensure input is in correct dtype
-        dtype = hidden_states.dtype
-        device = hidden_states.device
+    def forward(self, hidden_states, memory=None):
+        # Project input to correct dimension
+        if hidden_states.size(-1) != self.hidden_size:
+            hidden_states = self.input_proj(hidden_states)
         
-        batch_size, seq_len, _ = hidden_states.size()
+        # Additional projection before processing
+        hidden_states = self.pre_adapter_proj(hidden_states)
         
-        # Process context and reasoning first
-        with torch.cuda.amp.autocast(enabled=True):
-            context_out, context_temps = self.context_processor(hidden_states)
-            reasoning_out, reasoning_temps = self.guided_reasoning(hidden_states)
-            importance = self.token_importance(hidden_states)
-            
-            # Ensure all tensors have correct dtype
-            context_out = context_out.to(dtype=dtype)
-            context_temps = context_temps.to(dtype=dtype)
-            reasoning_out = reasoning_out.to(dtype=dtype)
-            reasoning_temps = reasoning_temps.to(dtype=dtype)
-            importance = importance.to(dtype=dtype)
-            
-            # Ensure all tensors have correct shape
-            importance = importance.unsqueeze(-1).expand(-1, -1, self.hidden_size)
-            
-            # Apply weighting
-            context_weighted = context_out * context_temps
-            reasoning_weighted = reasoning_out * reasoning_temps
-            token_weighted = hidden_states * importance
-            
-            # Combine features
-            combined_features = torch.cat([
-                context_weighted,
-                reasoning_weighted,
-                token_weighted,
-                hidden_states
-            ], dim=-1)
-            
-            # Feature fusion
-            fused_features = self.feature_fusion(combined_features)
-            
-            # Multi-head attention processing
-            q = self.q_proj(hidden_states).view(
-                batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-            k = self.k_proj(fused_features).view(
-                batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-            v = self.v_proj(fused_features).view(
-                batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-            
-            # Compute attention
-            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.attention_scale
-            attn_weights = F.softmax(attn_weights, dim=-1)
-            attn_weights = self.dropout(attn_weights)
-            attn_output = torch.matmul(attn_weights, v)
-            
-            # Reshape and project output
-            attn_output = attn_output.transpose(1, 2).contiguous().view(
-                batch_size, seq_len, self.hidden_size)
-            attn_output = self.o_proj(attn_output)
-            
-            # Final fusion with residual connection
-            final_combined = torch.cat([hidden_states, attn_output], dim=-1)
-            output = self.final_fusion(final_combined)
-            output = self.layer_norm(output)
-            output = hidden_states + self.scale * self.dropout(output)
-            
-            # Ensure output has same dtype as input
-            output = output.to(dtype=dtype)
+        # Get input dimensions
+        batch_size, seq_len, hidden_size = hidden_states.size()
+        
+        # Process through components and project outputs
+        context_out = self.context_processor(hidden_states)  
+        context_out = self.context_proj(context_out)
+        
+        reasoning_out = self.reasoning_proj(self.guided_reasoning(hidden_states))
+        importance_out = self.importance_proj(self.token_importance(hidden_states, memory=memory))
+        
+        # Project all features to same dimension space
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+        
+        # Reshape for attention
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Compute attention scores
+        attention_scores = torch.matmul(q, k.transpose(-2, -1)) * self.attention_scale
+        attention_probs = F.softmax(attention_scores, dim=-1)
+        attention_probs = self.dropout(attention_probs)
+        
+        # Apply attention
+        attention_output = torch.matmul(attention_probs, v)
+        attention_output = attention_output.transpose(1, 2).contiguous()
+        attention_output = attention_output.view(batch_size, seq_len, hidden_size)
+        attention_output = self.o_proj(attention_output)
+        
+        # Combine all features
+        combined_features = torch.cat([
+            attention_output,
+            context_out,
+            reasoning_out,
+            importance_out
+        ], dim=-1)
+        
+        # Final fusion
+        fused = self.feature_fusion(combined_features)
+        output = self.final_fusion(torch.cat([hidden_states, fused], dim=-1))
+        output = self.layer_norm(output)
+        output = hidden_states + self.scale * output
         
         return output
-
