@@ -12,10 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Any, Dict, Optional, TypedDict
-
+import os
+import re
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq, AutoProcessor, AutoTokenizer
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing_extensions import TypedDict
+
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForVision2Seq,
+    AutoTokenizer,
+    PreTrainedModel,
+    PreTrainedTokenizer,
+)
+
 from trl import AutoModelForCausalLMWithValueHead
 
 from ..extras import logging
@@ -57,6 +68,7 @@ def _get_init_kwargs(model_args: "ModelArguments") -> Dict[str, Any]:
         "cache_dir": model_args.cache_dir,
         "revision": model_args.model_revision,
         "token": model_args.hf_hub_token,
+        "torch_dtype": torch.bfloat16 if getattr(model_args, "bf16", False) else torch.float16
     }
 
 
@@ -160,8 +172,6 @@ def load_model(
             else:
                 model = load_class.from_pretrained(
                     model_args.model_name_or_path,
-                    torch_dtype=init_kwargs["torch_dtype"],
-                    low_cpu_mem_usage=True,
                     **init_kwargs
                 )
 
