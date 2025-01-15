@@ -803,14 +803,15 @@ class DTATAdapter(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
         
-        # Input projection layers
-        self.input_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        # Input projection layers for different dimensions
+        self.input_proj_152064 = nn.Linear(152064, config.hidden_size)
+        self.input_proj_151936 = nn.Linear(151936, config.hidden_size)
         self.pre_adapter_proj = nn.Linear(config.hidden_size, config.hidden_size)
         
         # Initialize components
         self.context_processor = ContextProcessor(config)
         self.guided_reasoning = GuidedReasoning(config)
-        self.token_importance = EnhancedTokenImportance(config)
+        self.token_importance = TokenImportance(config)
         
         # Component projections
         self.context_proj = nn.Linear(config.hidden_size, config.hidden_size)
@@ -826,7 +827,7 @@ class DTATAdapter(nn.Module):
         # Initialize with small weights
         for proj in [self.q_proj, self.k_proj, self.v_proj, self.o_proj,
                     self.context_proj, self.reasoning_proj, self.importance_proj,
-                    self.input_proj, self.pre_adapter_proj]:
+                    self.input_proj_152064, self.input_proj_151936, self.pre_adapter_proj]:
             nn.init.normal_(proj.weight, mean=0.0, std=0.02)
             if proj.bias is not None:
                 nn.init.zeros_(proj.bias)
@@ -859,9 +860,11 @@ class DTATAdapter(nn.Module):
                     self.register_buffer(name, buffer.to(dtype=dtype))
 
     def forward(self, hidden_states, memory=None):
-        # Project input to correct dimension
-        if hidden_states.size(-1) != self.hidden_size:
-            hidden_states = self.input_proj(hidden_states)
+        # Project input to correct dimension if needed
+        if hidden_states.size(-1) == 152064:
+            hidden_states = self.input_proj_152064(hidden_states)
+        elif hidden_states.size(-1) == 151936:
+            hidden_states = self.input_proj_151936(hidden_states)
         
         # Additional projection before processing
         hidden_states = self.pre_adapter_proj(hidden_states)
@@ -870,11 +873,9 @@ class DTATAdapter(nn.Module):
         batch_size, seq_len, hidden_size = hidden_states.size()
         
         # Process through components and project outputs
-        context_out = self.context_processor(hidden_states)  
-        context_out = self.context_proj(context_out)
-        
+        context_out = self.context_proj(self.context_processor(hidden_states))
         reasoning_out = self.reasoning_proj(self.guided_reasoning(hidden_states))
-        importance_out = self.importance_proj(self.token_importance(hidden_states, memory=memory))
+        importance_out = self.importance_proj(self.token_importance(hidden_states))
         
         # Project all features to same dimension space
         q = self.q_proj(hidden_states)

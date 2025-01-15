@@ -182,7 +182,13 @@ def load_model(
             if not hasattr(model, "dtat_adapter"):
                 model.dtat_adapter = DTATAdapter(model.config)
                 model._original_forward = model.forward
-                model._input_proj = nn.Linear(152064, model.config.hidden_size).to(
+                
+                # Create input projections for both possible dimensions
+                model._input_proj_152064 = nn.Linear(152064, model.config.hidden_size).to(
+                    device=next(model.parameters()).device,
+                    dtype=next(model.parameters()).dtype
+                )
+                model._input_proj_151936 = nn.Linear(151936, model.config.hidden_size).to(
                     device=next(model.parameters()).device,
                     dtype=next(model.parameters()).dtype
                 )
@@ -198,16 +204,20 @@ def load_model(
                         hidden_states = outputs.get("hidden_states", outputs.get("logits"))
                         if hidden_states is not None:
                             # Project to correct dimension before DTAT
-                            if hidden_states.size(-1) != self.config.hidden_size:
-                                hidden_states = self._input_proj(hidden_states)
+                            if hidden_states.size(-1) == 152064:
+                                hidden_states = self._input_proj_152064(hidden_states)
+                            elif hidden_states.size(-1) == 151936:
+                                hidden_states = self._input_proj_151936(hidden_states)
                             # Process through DTAT adapter
                             dtat_output = self.dtat_adapter(hidden_states)
                             outputs["logits"] = dtat_output
                     else:
                         hidden_states = outputs[0] if isinstance(outputs, tuple) else outputs
                         # Project to correct dimension before DTAT
-                        if hidden_states.size(-1) != self.config.hidden_size:
-                            hidden_states = self._input_proj(hidden_states)
+                        if hidden_states.size(-1) == 152064:
+                            hidden_states = self._input_proj_152064(hidden_states)
+                        elif hidden_states.size(-1) == 151936:
+                            hidden_states = self._input_proj_151936(hidden_states)
                         # Process through DTAT adapter
                         enhanced = self.dtat_adapter(hidden_states)
                         if isinstance(outputs, tuple):
