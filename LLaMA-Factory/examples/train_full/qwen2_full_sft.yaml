@@ -12,10 +12,8 @@ dataset: Sky-T1
 template: qwen25
 cutoff_len: 20671
 max_samples: 1000000
-max_steps: 3000
 overwrite_cache: true
 preprocessing_num_workers: 16
-
 ### output
 output_dir: saves/Sky-T1-32B-Preview/full/original
 logging_steps: 1
