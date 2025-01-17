@@ -469,25 +469,28 @@ class EnhancedReasoning(nn.Module):
             nn.Sigmoid()
         )
         
-        # Output integration
-        self.output = nn.Sequential(
+        # Enhancement integration (not replacement)
+        self.enhancement = nn.Sequential(
             nn.Linear(config.hidden_size * 2, config.hidden_size),
             nn.LayerNorm(config.hidden_size),
-            nn.Dropout(0.1)
+            nn.GELU()
         )
     
     def forward(self, x, input_ids, attention_mask=None):
+        # Store original input
+        original_x = x
+        
         # 1. Process semantics
         semantic_state, semantic_info = self.semantic(
             x, input_ids, attention_mask
         )
         
-        # 2. Compute temperatures
+        # 2. Compute temperatures (importance weights)
         temps = self.temperature(torch.cat([
-            x, semantic_state
+            original_x, semantic_state
         ], dim=-1))
         
-        # 3. Initialize reasoning
+        # 3. Initialize reasoning from semantic state
         state = semantic_state
         all_states = []
         all_validities = []
@@ -517,14 +520,14 @@ class EnhancedReasoning(nn.Module):
                 )
             ).squeeze(1)
             
-            # Update state
+            # Accumulate enhancement (not replace)
             state = state + best_step
             
             # Store progress
             all_states.append(state)
             all_validities.append(validities)
             
-            # Check if reasoning is complete
+            # Check if reasoning is sufficient
             if validities.mean() > min_validity:
                 break
         
@@ -534,12 +537,15 @@ class EnhancedReasoning(nn.Module):
         
         # Weight by validities
         weights = F.softmax(reasoning_validities, dim=1).unsqueeze(-1)
-        reasoned = (reasoning_states * weights).sum(1)
+        reasoned_enhancement = (reasoning_states * weights).sum(1)
         
-        # Final output
-        output = self.output(torch.cat([x, reasoned], dim=-1))
+        # Create enhancement (not replacement)
+        enhancement = self.enhancement(
+            torch.cat([original_x, reasoned_enhancement], dim=-1)
+        )
         
-        return output, {
+        # Return enhanced state and metadata
+        return enhancement, {
             'semantic': semantic_info,
             'temperatures': temps,
             'reasoning_states': reasoning_states,
@@ -564,19 +570,24 @@ class SimpleDTAT(nn.Module):
         # Add DTAT enhancement layer
         self.dtat_processor = SimpleReasoningLayer(config)
         
-        # Optional: Projection layer to match dimensions if needed
-        self.output_proj = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.LayerNorm(config.hidden_size)
+        # Blend factor - learnable parameter
+        self.alpha = nn.Parameter(torch.tensor(0.2))  # Start with more weight on original
+        self.sigmoid = nn.Sigmoid()  # Keep alpha between 0 and 1
+        
+        # Enhancement projection
+        self.enhancement_proj = nn.Sequential(
+            nn.Linear(config.hidden_size * 2, config.hidden_size),
+            nn.LayerNorm(config.hidden_size),
+            nn.GELU()
         )
         
         # Initialize only our new weights
         self.dtat_processor.apply(self._init_weights)
-        self.output_proj.apply(self._init_weights)
+        self.enhancement_proj.apply(self._init_weights)
         
         # Count only the new parameters we're adding
         dtat_params = sum(p.numel() for p in self.dtat_processor.parameters())
-        proj_params = sum(p.numel() for p in self.output_proj.parameters())
+        proj_params = sum(p.numel() for p in self.enhancement_proj.parameters())
         print(f"DTAT enhancement initialized with {dtat_params + proj_params:,} additional parameters")
     
     def _init_weights(self, module):
@@ -584,25 +595,41 @@ class SimpleDTAT(nn.Module):
             module.weight.data.normal_(mean=0.0, std=0.02)
             if module.bias is not None:
                 module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=0.02)
     
     def forward(self, input_ids, attention_mask=None, **kwargs):
-        # Get base model output
+        # Get base model output - keeping original computation path intact
         base_outputs = self.base_model(input_ids, attention_mask=attention_mask, **kwargs)
+        original_hidden_states = base_outputs.last_hidden_state
         
-        # Enhance with DTAT
-        enhanced = self.dtat_processor(
-            base_outputs.last_hidden_state,
+        # Get DTAT enhancements
+        dtat_enhanced, reasoning_info = self.dtat_processor(
+            original_hidden_states,
             input_ids,
             attention_mask
         )
         
-        # Project back to original space
-        final_output = self.output_proj(enhanced)
+        # Compute dynamic blend factor
+        alpha = self.sigmoid(self.alpha)
         
-        # Return with same structure as base model
-        base_outputs.last_hidden_state = final_output
+        # Combine original and enhanced states
+        combined = self.enhancement_proj(
+            torch.cat([original_hidden_states, dtat_enhanced], dim=-1)
+        )
+        
+        # Enhanced hidden state = original + enhancement
+        enhanced_hidden_states = original_hidden_states + alpha * combined
+        
+        # Return enhanced outputs while preserving original structure
+        base_outputs.last_hidden_state = enhanced_hidden_states
+        
+        # Store enhancement info for analysis
+        if not hasattr(base_outputs, 'enhancement_info'):
+            base_outputs.enhancement_info = {}
+        base_outputs.enhancement_info.update({
+            'dtat_blend_factor': alpha.item(),
+            'reasoning_steps': reasoning_info
+        })
+        
         return base_outputs
     
     def prepare_inputs_for_generation(self, *args, **kwargs):
