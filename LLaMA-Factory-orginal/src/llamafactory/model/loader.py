@@ -152,21 +152,20 @@ def load_model(
             if type(config) in AutoModelForVision2Seq._model_mapping.keys():  # assume built-in models
                 load_class = AutoModelForVision2Seq
             else:
-                if hasattr(model_args, 'use_dtat') and model_args.use_dtat:
-                    logger.info_rank0(" Initializing DTAT (Dynamic Token-Aware Transformer) model...")
-                    model = SimpleDTAT(config)
-                    logger.info_rank0(f"DTAT Model initialized with {config.num_hidden_layers} reasoning layers")
-                    logger.info_rank0(f"Token importance enabled with hidden size: {config.hidden_size}")
-                else:
-                    load_class = AutoModelForCausalLM
+                load_class = AutoModelForCausalLM
 
             if model_args.train_from_scratch:
                 model = load_class.from_config(config, trust_remote_code=True)
             else:
                 model = load_class.from_pretrained(**init_kwargs)
 
-        if model_args.mixture_of_depths == "convert":
-            model = convert_pretrained_model_to_mod(model, config, model_args)
+            if hasattr(model_args, 'use_dtat') and model_args.use_dtat:
+                logger.info_rank0(" Initializing DTAT (Dynamic Token-Aware Transformer) enhancement...")
+                model = SimpleDTAT(base_model=model, config=config)
+                logger.info_rank0(f"DTAT enhancement layer added on top of the base model")
+
+            if model_args.mixture_of_depths == "convert":
+                model = convert_pretrained_model_to_mod(model, config, model_args)
 
     if not lazy_load:
         patch_model(model, tokenizer, model_args, is_trainable, add_valuehead)

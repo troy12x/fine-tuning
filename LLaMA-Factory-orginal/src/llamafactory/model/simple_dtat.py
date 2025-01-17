@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 class EfficientContextProcessor(nn.Module):
     def __init__(self, config):
@@ -43,7 +44,6 @@ class MemoryEfficientProcessor:
         return torch.cat([chunk for chunk in chunks], dim=dim)
     
     @staticmethod
-    @torch.jit.script
     def efficient_attention(q, k, v, mask=None):
         """Memory-efficient attention implementation"""
         B, H, T, D = q.shape
@@ -83,9 +83,6 @@ class ConceptHierarchy(nn.Module):
             nn.Parameter(torch.zeros(config.vocab_size, config.hidden_size).normal_(0, 0.02))
             for _ in range(self.num_levels)
         ])
-        
-        # Gradient checkpointing for memory efficiency
-        self.use_checkpoint = True
         
         # Concept layers with memory optimization
         self.concept_layers = nn.ModuleList([
@@ -133,90 +130,43 @@ class ConceptHierarchy(nn.Module):
             elif 'bias' in name:
                 nn.init.zeros_(p)
     
-    @torch.jit.script
-    def get_concept_embeddings(self, x, input_ids, level):
-        """Memory-efficient concept embedding lookup"""
-        B, T = input_ids.shape
-        H = self.hidden_size
-        
-        # Use sparse operations for memory efficiency
-        concept_embeds = F.embedding(
-            input_ids,
-            self.level_concepts[level],
-            sparse=True
-        )  # [B, T, H]
-        
-        return concept_embeds
+    def get_concept_embeddings(self, input_ids: torch.Tensor, level: int) -> torch.Tensor:
+        return F.embedding(input_ids, self.level_concepts[level], sparse=True)
     
-    def forward(self, x, input_ids, attention_mask=None):
-        """Memory-efficient forward pass with gradient checkpointing"""
+    def forward(self, x: torch.Tensor, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, T, H = x.size()
         all_concepts = []
         level_x = x
         
-        # Process in chunks for memory efficiency
-        chunk_size = min(T, 512)  # Adjust based on GPU memory
-        
+        # Process each level
         for level in range(self.num_levels):
-            def create_custom_forward(module):
-                def custom_forward(*inputs):
-                    return module(*inputs)
-                return custom_forward
+            # Get concepts
+            concepts = self.get_concept_embeddings(input_ids, level)
             
-            # Process chunks
-            level_chunks = []
-            for i in range(0, T, chunk_size):
-                end_idx = min(i + chunk_size, T)
-                chunk_mask = attention_mask[:, i:end_idx] if attention_mask is not None else None
-                
-                # Get concepts for chunk
-                chunk_concepts = self.get_concept_embeddings(
-                    x[:, i:end_idx],
-                    input_ids[:, i:end_idx],
-                    level
-                )  # [B, chunk_size, H]
-                
-                # Process chunk with gradient checkpointing
-                if self.use_checkpoint and self.training:
-                    chunk_features = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(self.concept_layers[level]['extractor']),
-                        level_x[:, i:end_idx],
-                        chunk_mask
-                    )  # [B, chunk_size, H]
-                else:
-                    chunk_features = self.concept_layers[level]['extractor'](
-                        level_x[:, i:end_idx],
-                        src_key_padding_mask=chunk_mask
-                    )  # [B, chunk_size, H]
-                
-                # Project and combine
-                chunk_concepts = self.concept_layers[level]['projector'](chunk_concepts)  # [B, chunk_size, H]
-                chunk_combined = self.concept_layers[level]['aggregator'](
-                    torch.cat([chunk_features, chunk_concepts], dim=-1)  # [B, chunk_size, 2H]
-                )  # [B, chunk_size, H]
-                
-                # Add residual and normalize
-                chunk_combined = self.norm(chunk_combined + level_x[:, i:end_idx])  # [B, chunk_size, H]
-                level_chunks.append(chunk_combined)
+            # Extract features
+            features = self.concept_layers[level]['extractor'](
+                level_x,
+                src_key_padding_mask=~attention_mask if attention_mask is not None else None
+            )
             
-            # Combine chunks
-            combined = torch.cat(level_chunks, dim=1)  # [B, T, H]
-            all_concepts.append(combined)
+            # Project and combine
+            concepts = self.concept_layers[level]['projector'](concepts)
+            combined = self.concept_layers[level]['aggregator'](
+                torch.cat([features, concepts], dim=-1)
+            )
             
-            # Cross-level attention
+            # Add residual and normalize
+            level_x = self.norm(combined + level_x)
+            all_concepts.append(level_x)
+            
+            # Cross-level attention except for last level
             if level < self.num_levels - 1:
-                # Reshape for attention
-                q = combined.view(B, T, H)  # [B, T, H]
-                k = combined.view(B, T, H)  # [B, T, H]
-                v = combined.view(B, T, H)  # [B, T, H]
-                
-                # Apply attention
                 level_x, _ = self.cross_level_attention[level](
-                    q, k, v,
-                    key_padding_mask=attention_mask
-                )  # [B, T, H]
+                    level_x, level_x, level_x,
+                    key_padding_mask=~attention_mask if attention_mask is not None else None
+                )
         
-        return all_concepts  # List of [B, T, H] tensors
+        return torch.stack(all_concepts, dim=1)  # [B, num_levels, T, H]
 
 class RelationalGraphBuilder(nn.Module):
     def __init__(self, config):
@@ -267,7 +217,6 @@ class RelationalGraphBuilder(nn.Module):
         self.eps = 1e-6
         self.scale = math.sqrt(self.head_dim)  # Proper scaling factor
     
-    @torch.jit.script
     def build_edges(self, nodes, mask=None):
         """Numerically stable edge building"""
         B, T, H = nodes.size()
@@ -404,7 +353,6 @@ class LogicalReasoner(nn.Module):
             self.step_validator = torch.jit.script(self.step_validator)
             self.path_scorer = torch.jit.script(self.path_scorer)
     
-    @torch.jit.script
     def generate_step(self, state, temps, mask=None):
         """Optimized step generation"""
         B, T, H = state.size()
@@ -427,7 +375,6 @@ class LogicalReasoner(nn.Module):
         
         return self.norm(op_steps)
     
-    @torch.jit.script
     def validate_step(self, step, prev_state):
         """Memory-efficient step validation"""
         B, O, T, H = step.size()
@@ -446,7 +393,6 @@ class LogicalReasoner(nn.Module):
         validity = self.step_validator(valid_input)  # [B*O*T, 1]
         return validity.view(B, O, T, 1)
     
-    @torch.jit.script
     def score_path(self, path_states):
         """Optimized path scoring"""
         B, S, T, H = path_states.size()
@@ -610,56 +556,63 @@ class SimpleReasoningLayer(nn.Module):
         return self.reasoning(x, input_ids, attention_mask)
 
 class SimpleDTAT(nn.Module):
-    def __init__(self, config):
+    def __init__(self, base_model, config):
         super().__init__()
         self.config = config
+        self.base_model = base_model
         
-        # Token embeddings
-        self.wte = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.drop = nn.Dropout(config.hidden_dropout_prob)
+        # Add DTAT enhancement layer
+        self.dtat_processor = SimpleReasoningLayer(config)
         
-        # Reasoning layers with CoT
-        self.reasoning_layers = nn.ModuleList([
-            SimpleReasoningLayer(config) 
-            for _ in range(config.num_hidden_layers)
-        ])
+        # Optional: Projection layer to match dimensions if needed
+        self.output_proj = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.LayerNorm(config.hidden_size)
+        )
         
-        self.ln_f = nn.LayerNorm(config.hidden_size)
-        self.gradient_checkpointing = True
+        # Initialize only our new weights
+        self.dtat_processor.apply(self._init_weights)
+        self.output_proj.apply(self._init_weights)
         
-        # Initialize weights
-        self.apply(self._init_weights)
-        
-        n_params = sum(p.numel() for p in self.parameters())
-        print(f"SimpleDTAT initialized with {n_params:,} parameters")
-
+        # Count only the new parameters we're adding
+        dtat_params = sum(p.numel() for p in self.dtat_processor.parameters())
+        proj_params = sum(p.numel() for p in self.output_proj.parameters())
+        print(f"DTAT enhancement initialized with {dtat_params + proj_params:,} additional parameters")
+    
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            module.weight.data.normal_(mean=0.0, std=0.02)
             if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+                module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-
-    def forward(self, input_ids, attention_mask=None):
-        x = self.wte(input_ids)
-        x = self.drop(x)
+            module.weight.data.normal_(mean=0.0, std=0.02)
+    
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        # Get base model output
+        base_outputs = self.base_model(input_ids, attention_mask=attention_mask, **kwargs)
         
-        # Store intermediate thoughts
-        all_thoughts = []
+        # Enhance with DTAT
+        enhanced = self.dtat_processor(
+            base_outputs.last_hidden_state,
+            input_ids,
+            attention_mask
+        )
         
-        for layer in self.reasoning_layers:
-            if self.gradient_checkpointing and self.training:
-                x, thoughts = torch.utils.checkpoint.checkpoint(layer, x, input_ids, attention_mask)
-            else:
-                x, thoughts = layer(x, input_ids, attention_mask)
-            all_thoughts.append(thoughts)
+        # Project back to original space
+        final_output = self.output_proj(enhanced)
         
-        x = self.ln_f(x)
-        return x, all_thoughts  # Return both output and reasoning steps
-
-    def clip_gradients(self):
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+        # Return with same structure as base model
+        base_outputs.last_hidden_state = final_output
+        return base_outputs
+    
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        # Delegate to base model for generation
+        return self.base_model.prepare_inputs_for_generation(*args, **kwargs)
+    
+    def _reorder_cache(self, *args, **kwargs):
+        # Delegate to base model for cache reordering
+        return self.base_model._reorder_cache(*args, **kwargs)
+    
+    @property
+    def device(self):
+        return self.base_model.device
