@@ -1628,6 +1628,10 @@ register_model_group(
             DownloadSource.DEFAULT: "Qwen/Qwen2.5-0.5B",
             DownloadSource.MODELSCOPE: "Qwen/Qwen2.5-0.5B",
         },
+          "silx-ai/Quasar-1": {
+            DownloadSource.DEFAULT: "silx-ai/Quasar-1",
+            DownloadSource.MODELSCOPE: "silx-ai/Quasar-1",
+        },
         "Qwen2.5-1.5B": {
             DownloadSource.DEFAULT: "Qwen/Qwen2.5-1.5B",
             DownloadSource.MODELSCOPE: "Qwen/Qwen2.5-1.5B",
