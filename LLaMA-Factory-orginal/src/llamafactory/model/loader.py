@@ -159,11 +159,6 @@ def load_model(
             else:
                 model = load_class.from_pretrained(**init_kwargs)
 
-            if hasattr(model_args, 'use_dtat') and model_args.use_dtat:
-                logger.info_rank0(" Initializing DTAT (Dynamic Token-Aware Transformer) enhancement...")
-                model = SimpleDTAT(base_model=model, config=config)
-                logger.info_rank0(f"DTAT enhancement layer added on top of the base model")
-
             if model_args.mixture_of_depths == "convert":
                 model = convert_pretrained_model_to_mod(model, config, model_args)
 
@@ -172,6 +167,12 @@ def load_model(
         register_autoclass(config, model, tokenizer)
 
     model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
+
+    # Add DTAT enhancement layer after all model setup is complete
+    if hasattr(model_args, 'use_dtat') and model_args.use_dtat:
+        logger.info_rank0(" Initializing DTAT (Dynamic Token-Aware Transformer) enhancement...")
+        model = SimpleDTAT(base_model=model, config=config)
+        logger.info_rank0(f"DTAT enhancement layer added on top of the base model")
 
     if add_valuehead:
         model = AutoModelForCausalLMWithValueHead.from_pretrained(model)
