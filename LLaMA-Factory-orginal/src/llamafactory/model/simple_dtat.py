@@ -4,67 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-class EfficientContextProcessor(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        # Simplified multi-scale with just 2 key scales
-        self.conv_scales = nn.ModuleList([
-            nn.Conv1d(
-                in_channels=config.hidden_size,
-                out_channels=config.hidden_size // 2,
-                kernel_size=2**i + 1,
-                padding='same',
-                groups=8  # Group convolution for efficiency
-            ) for i in range(2)  # Reduced to 2 scales
-        ])
-        
-        # Streamlined fusion
-        self.fusion = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.LayerNorm(config.hidden_size)
-        )
-    
-    def forward(self, x):
-        x_reshaped = x.transpose(1, 2)
-        multi_scale = []
-        for conv in self.conv_scales:
-            scale_out = conv(x_reshaped)
-            multi_scale.append(scale_out)
-        
-        combined = torch.cat(multi_scale, dim=1)
-        return self.fusion(combined.transpose(1, 2))
-
-class MemoryEfficientProcessor:
-    """Memory-efficient processing utilities"""
-    
-    @staticmethod
-    def chunk_forward(tensor, chunk_size, dim=0):
-        """Process large tensors in chunks"""
-        chunks = tensor.chunk(max(tensor.size(dim) // chunk_size, 1), dim=dim)
-        return torch.cat([chunk for chunk in chunks], dim=dim)
-    
-    @staticmethod
-    def efficient_attention(q, k, v, mask=None):
-        """Memory-efficient attention implementation"""
-        B, H, T, D = q.shape
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D)
-        
-        if mask is not None:
-            scores = scores.masked_fill(~mask.view(B, 1, 1, T), float('-inf'))
-        
-        # Compute attention in chunks to save memory
-        attn_chunks = []
-        chunk_size = 1024  # Adjust based on available memory
-        
-        for i in range(0, T, chunk_size):
-            end_idx = min(i + chunk_size, T)
-            chunk_scores = scores[:, :, i:end_idx, :]
-            chunk_probs = torch.softmax(chunk_scores, dim=-1)
-            chunk_output = torch.matmul(chunk_probs, v)
-            attn_chunks.append(chunk_output)
-        
-        return torch.cat(attn_chunks, dim=2)
-
 class ConceptHierarchy(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -73,18 +12,13 @@ class ConceptHierarchy(nn.Module):
         self.vocab_size = config.vocab_size
         self.num_heads = config.num_attention_heads
         
-        # Validate config
-        assert hasattr(config, 'vocab_size'), "Config must specify vocab_size"
-        if hasattr(config, 'tokenizer_vocab_size'):
-            assert config.vocab_size == config.tokenizer_vocab_size
-        
         # Memory-efficient embeddings using sparse tensors
         self.level_concepts = nn.ParameterList([
             nn.Parameter(torch.zeros(config.vocab_size, config.hidden_size).normal_(0, 0.02))
             for _ in range(self.num_levels)
         ])
         
-        # Concept layers with memory optimization
+        # Concept enhancement layers
         self.concept_layers = nn.ModuleList([
             nn.ModuleDict({
                 'extractor': nn.TransformerEncoderLayer(
@@ -93,19 +27,18 @@ class ConceptHierarchy(nn.Module):
                     dim_feedforward=config.hidden_size * 4,
                     batch_first=True,
                     dropout=0.1,
-                    norm_first=True  # More stable training
+                    norm_first=True
                 ),
-                'aggregator': nn.Sequential(
+                'enhancer': nn.Sequential(
                     nn.Linear(config.hidden_size * 2, config.hidden_size),
                     nn.LayerNorm(config.hidden_size),
                     nn.GELU()
-                ),
-                'projector': nn.Linear(config.hidden_size, config.hidden_size)
+                )
             }) for _ in range(self.num_levels)
         ])
         
-        # Cross-level attention with memory-efficient implementation
-        self.cross_level_attention = nn.ModuleList([
+        # Cross-level enhancement
+        self.cross_enhance = nn.ModuleList([
             nn.MultiheadAttention(
                 embed_dim=config.hidden_size,
                 num_heads=config.num_attention_heads,
@@ -114,59 +47,68 @@ class ConceptHierarchy(nn.Module):
             ) for _ in range(self.num_levels - 1)
         ])
         
-        # Numerical stability
-        self.eps = 1e-6
-        self.norm = nn.LayerNorm(config.hidden_size)
+        # Enhancement factors for each level
+        self.level_factors = nn.ParameterList([
+            nn.Parameter(torch.tensor(0.1))
+            for _ in range(self.num_levels)
+        ])
+        self.sigmoid = nn.Sigmoid()
         
-        # Initialize with proper scaling
-        self._init_weights()
-    
-    def _init_weights(self):
-        """Initialize weights with proper scaling"""
-        for name, p in self.named_parameters():
-            if 'weight' in name:
-                # Scaled initialization
-                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self.num_levels))
-            elif 'bias' in name:
-                nn.init.zeros_(p)
+        self.norm = nn.LayerNorm(config.hidden_size)
     
     def get_concept_embeddings(self, input_ids: torch.Tensor, level: int) -> torch.Tensor:
         return F.embedding(input_ids, self.level_concepts[level], sparse=True)
     
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        B, T, H = x.size()
-        all_concepts = []
-        level_x = x
+        # Store original input
+        original_x = x
         
         # Process each level
+        current_x = x
+        all_concepts = []
+        enhancement_factors = []
+        
         for level in range(self.num_levels):
             # Get concepts
             concepts = self.get_concept_embeddings(input_ids, level)
             
             # Extract features
             features = self.concept_layers[level]['extractor'](
-                level_x,
+                current_x,
                 src_key_padding_mask=~attention_mask if attention_mask is not None else None
             )
             
-            # Project and combine
-            concepts = self.concept_layers[level]['projector'](concepts)
-            combined = self.concept_layers[level]['aggregator'](
+            # Generate enhancement
+            enhancement = self.concept_layers[level]['enhancer'](
                 torch.cat([features, concepts], dim=-1)
             )
             
-            # Add residual and normalize
-            level_x = self.norm(combined + level_x)
-            all_concepts.append(level_x)
+            # Compute level-specific enhancement factor
+            level_factor = self.sigmoid(self.level_factors[level])
+            enhancement_factors.append(level_factor.item())
             
-            # Cross-level attention except for last level
+            # Enhanced state = current + weighted enhancement
+            current_x = current_x + level_factor * enhancement
+            current_x = self.norm(current_x)
+            
+            all_concepts.append(current_x)
+            
+            # Cross-level enhancement
             if level < self.num_levels - 1:
-                level_x, _ = self.cross_level_attention[level](
-                    level_x, level_x, level_x,
+                cross_enhanced, _ = self.cross_enhance[level](
+                    current_x, current_x, current_x,
                     key_padding_mask=~attention_mask if attention_mask is not None else None
                 )
+                current_x = current_x + 0.1 * cross_enhanced  # Small fixed factor for cross-enhancement
         
-        return torch.stack(all_concepts, dim=1)  # [B, num_levels, T, H]
+        # Final enhancement combining all levels
+        final_enhancement = torch.stack(all_concepts, dim=1).mean(dim=1)
+        final_enhanced = original_x + 0.1 * final_enhancement  # Conservative final enhancement
+        
+        return final_enhanced, {
+            'level_factors': enhancement_factors,
+            'num_levels': self.num_levels
+        }
 
 class RelationalGraphBuilder(nn.Module):
     def __init__(self, config):
@@ -175,30 +117,30 @@ class RelationalGraphBuilder(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
         
-        # Edge type embeddings with proper initialization
+        # Edge type embeddings
         self.num_edge_types = 8
         self.edge_embeddings = nn.Parameter(
             torch.zeros(self.num_edge_types, config.hidden_size)
         )
         nn.init.normal_(self.edge_embeddings, std=0.02 / math.sqrt(self.num_edge_types))
         
-        # Edge type projection with layer norm for stability
-        self.edge_proj = nn.Sequential(
+        # Edge enhancement projection
+        self.edge_enhance = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.LayerNorm(config.hidden_size)
         )
         
-        # Numerically stable edge scorer
+        # Edge scoring with stability
         self.edge_scorer = nn.Sequential(
-            nn.LayerNorm(config.hidden_size * 3),  # Normalize inputs
+            nn.LayerNorm(config.hidden_size * 3),
             nn.Linear(config.hidden_size * 3, config.hidden_size),
             nn.GELU(),
-            nn.LayerNorm(config.hidden_size),  # Intermediate normalization
+            nn.LayerNorm(config.hidden_size),
             nn.Linear(config.hidden_size, self.num_edge_types)
         )
         
-        # Graph propagation with stability improvements
-        self.graph_prop = nn.ModuleList([
+        # Graph propagation layers
+        self.graph_enhance = nn.ModuleList([
             nn.Sequential(
                 nn.MultiheadAttention(
                     embed_dim=config.hidden_size,
@@ -210,210 +152,127 @@ class RelationalGraphBuilder(nn.Module):
             ) for _ in range(2)
         ])
         
-        self.norm = nn.LayerNorm(config.hidden_size)
-        self.dropout = nn.Dropout(0.1)
+        # Enhancement factor
+        self.enhance_factor = nn.Parameter(torch.tensor(0.1))
+        self.sigmoid = nn.Sigmoid()
         
         # Numerical stability
         self.eps = 1e-6
-        self.scale = math.sqrt(self.head_dim)  # Proper scaling factor
+        self.scale = math.sqrt(self.head_dim)
+    
+    def forward(self, nodes, mask=None):
+        # Store original nodes
+        original_nodes = nodes
+        
+        # 1. Build edge representations
+        edges = self.build_edges(nodes, mask)
+        
+        # 2. Enhance nodes through graph
+        enhanced_nodes = self.propagate(nodes, edges, mask)
+        
+        # 3. Compute enhancement factor
+        enhance_weight = self.sigmoid(self.enhance_factor)
+        
+        # 4. Enhanced state = original + weighted enhancement
+        final_nodes = original_nodes + enhance_weight * enhanced_nodes
+        
+        return edges, final_nodes
     
     def build_edges(self, nodes, mask=None):
-        """Numerically stable edge building"""
         B, T, H = nodes.size()
         
-        # Project edge embeddings
-        edge_emb = self.edge_proj(self.edge_embeddings)  # [E, H]
+        # Compute pairwise node features
+        q = nodes.unsqueeze(2).expand(-1, -1, T, -1)  # [B, T, T, H]
+        k = nodes.unsqueeze(1).expand(-1, T, -1, -1)  # [B, T, T, H]
         
-        # Compute node pair representations efficiently
-        nodes_i = nodes.unsqueeze(2)  # [B, T, 1, H]
-        nodes_j = nodes.unsqueeze(1)  # [B, 1, T, H]
+        # Edge features
+        edge_features = torch.cat([
+            q,                      # Source node
+            k,                      # Target node
+            q * k / self.scale     # Interaction
+        ], dim=-1)
         
-        # Scale inputs for numerical stability
-        nodes_i = nodes_i / self.scale
-        nodes_j = nodes_j / self.scale
-        edge_emb = edge_emb / self.scale
+        # Score edge types
+        edge_logits = self.edge_scorer(edge_features)  # [B, T, T, num_edge_types]
+        edge_probs = F.softmax(edge_logits, dim=-1)
         
-        # Efficient edge computation
-        edge_inputs = torch.cat([
-            nodes_i.expand(-1, -1, T, -1),  # [B, T, T, H]
-            nodes_j.expand(-1, T, -1, -1),  # [B, T, T, H]
-            edge_emb.unsqueeze(0).unsqueeze(0).expand(B, T, T, -1)  # [B, T, T, H]
-        ], dim=-1)  # [B, T, T, 3H]
+        # Weight edge embeddings
+        weighted_edges = torch.einsum(
+            'btne,eh->btnh',
+            edge_probs,
+            self.edge_embeddings
+        )
         
-        # Compute edge scores with numerical stability
-        edge_scores = self.edge_scorer(edge_inputs)  # [B, T, T, E]
+        # Enhance edges
+        enhanced_edges = self.edge_enhance(weighted_edges)
         
         if mask is not None:
-            # Create attention mask
-            mask_2d = mask.unsqueeze(1) & mask.unsqueeze(2)  # [B, T, T]
-            edge_scores = edge_scores.masked_fill(
-                ~mask_2d.unsqueeze(-1),
-                float('-inf')
-            )
+            mask = mask.unsqueeze(1) & mask.unsqueeze(2)  # [B, T, T]
+            enhanced_edges = enhanced_edges.masked_fill(~mask.unsqueeze(-1), 0.0)
         
-        # Stable softmax with temperature scaling
-        edge_scores = edge_scores / self.scale
-        edge_probs = F.softmax(edge_scores, dim=-1)  # [B, T, T, E]
-        edge_probs = self.dropout(edge_probs)
-        
-        return edge_probs
+        return enhanced_edges
     
     def propagate(self, nodes, edges, mask=None):
-        """Memory-efficient graph propagation"""
-        B, T, H = nodes.size()
-        x = nodes
+        # Initial state
+        current = nodes
         
-        for prop_layer in self.graph_prop:
-            # Compute attention weights
-            edge_weights = edges.sum(dim=-1)  # [B, T, T]
+        # Propagate through layers
+        for layer in self.graph_enhance:
+            # Use edges to guide attention
+            edge_weights = torch.einsum(
+                'bthd,bshd->bths',
+                current / self.scale,
+                edges
+            )
             
-            # Apply attention scaling
-            edge_weights = edge_weights / (edge_weights.sum(dim=-1, keepdim=True) + self.eps)
-            
-            # Apply mask if provided
-            if mask is not None:
-                mask_2d = mask.unsqueeze(1) & mask.unsqueeze(2)  # [B, T, T]
-                edge_weights = edge_weights.masked_fill(~mask_2d, 0.0)
-            
-            # Reshape for attention
-            q = x.view(B, T, H)  # [B, T, H]
-            k = x.view(B, T, H)  # [B, T, H]
-            v = x.view(B, T, H)  # [B, T, H]
-            
-            # Apply attention
-            x_new, _ = prop_layer[0](
-                q, k, v,
+            # Apply attention with edge guidance
+            enhanced, _ = layer[0](
+                current, current, current,
                 attn_mask=edge_weights,
-                key_padding_mask=mask
-            )  # [B, T, H]
+                key_padding_mask=~mask if mask is not None else None
+            )
             
-            # Apply layer norm
-            x_new = prop_layer[1](x_new)  # [B, T, H]
-            
-            # Add residual and dropout
-            x = x + self.dropout(x_new)
+            # Residual connection and norm
+            current = current + enhanced
+            current = layer[1](current)
         
-        return x
+        return current
 
 class LogicalReasoner(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
         
-        # Step generator with optimized architecture
-        self.step_generator = nn.TransformerEncoder(
+        # Reasoning transformer
+        self.reasoning_layer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=config.hidden_size,
                 nhead=config.num_attention_heads,
                 dim_feedforward=config.hidden_size * 4,
                 batch_first=True,
-                norm_first=True  # Better gradient flow
+                norm_first=True
             ),
             num_layers=2
         )
         
-        # Optimized operator application
-        self.num_operators = 8
-        self.operators = nn.Parameter(
-            torch.zeros(self.num_operators, config.hidden_size)
-        )
-        nn.init.normal_(self.operators, std=0.02 / math.sqrt(self.num_operators))
-        
-        # Operator projection with layer norm
-        self.op_proj = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.LayerNorm(config.hidden_size)
-        )
-        
-        # Optimized step validator
-        self.step_validator = nn.Sequential(
-            nn.LayerNorm(config.hidden_size * 3),
-            nn.Linear(config.hidden_size * 3, config.hidden_size),
-            nn.GELU(),
-            nn.LayerNorm(config.hidden_size),
-            nn.Linear(config.hidden_size, 1),
-            nn.Sigmoid()
-        )
-        
-        # Path scorer with stability
-        self.path_scorer = nn.Sequential(
-            nn.LayerNorm(config.hidden_size * 2),
+        # Enhancement projection
+        self.enhance = nn.Sequential(
             nn.Linear(config.hidden_size * 2, config.hidden_size),
-            nn.GELU(),
             nn.LayerNorm(config.hidden_size),
-            nn.Linear(config.hidden_size, 1)
+            nn.GELU()
         )
-        
-        self.norm = nn.LayerNorm(config.hidden_size)
-        self.dropout = nn.Dropout(0.1)
-        
-        # Enable TorchScript for performance
-        self.use_script = True
-        if self.use_script:
-            self.step_validator = torch.jit.script(self.step_validator)
-            self.path_scorer = torch.jit.script(self.path_scorer)
     
-    def generate_step(self, state, temps, mask=None):
-        """Optimized step generation"""
-        B, T, H = state.size()
+    def forward(self, x, temps, mask=None):
+        # Apply reasoning attention
+        reasoned = self.reasoning_layer(x, src_key_padding_mask=~mask if mask is not None else None)
         
-        # Apply temperature scaling
-        weighted = state * temps.unsqueeze(-1)  # [B, T, H]
+        # Enhance with temperature-weighted attention
+        enhanced = self.enhance(torch.cat([
+            x * temps,  # Temperature-weighted input
+            reasoned   # Reasoned state
+        ], dim=-1))
         
-        # Generate steps efficiently
-        steps = self.step_generator(weighted, src_key_padding_mask=mask)  # [B, T, H]
-        
-        # Project operators once
-        ops = self.op_proj(self.operators)  # [O, H]
-        
-        # Efficient operator application
-        steps = steps.unsqueeze(1)  # [B, 1, T, H]
-        ops = ops.unsqueeze(0).unsqueeze(2)  # [1, O, 1, H]
-        
-        # Use broadcasting for efficiency
-        op_steps = steps * ops  # [B, O, T, H]
-        
-        return self.norm(op_steps)
-    
-    def validate_step(self, step, prev_state):
-        """Memory-efficient step validation"""
-        B, O, T, H = step.size()
-        
-        # Reshape efficiently
-        step_flat = step.view(-1, H)  # [B*O*T, H]
-        prev_flat = prev_state.unsqueeze(1).expand(-1, O, -1, -1).reshape(-1, H)
-        
-        # Compute validity scores
-        valid_input = torch.cat([
-            step_flat,
-            prev_flat,
-            step_flat * prev_flat
-        ], dim=-1)  # [B*O*T, 3H]
-        
-        validity = self.step_validator(valid_input)  # [B*O*T, 1]
-        return validity.view(B, O, T, 1)
-    
-    def score_path(self, path_states):
-        """Optimized path scoring"""
-        B, S, T, H = path_states.size()
-        
-        # Pre-allocate scores tensor
-        scores = torch.empty(B, S-1, T, 1, device=path_states.device)
-        
-        # Score adjacent steps efficiently
-        for i in range(S - 1):
-            # Get adjacent states
-            curr_state = path_states[:, i].reshape(-1, H)  # [B*T, H]
-            next_state = path_states[:, i+1].reshape(-1, H)  # [B*T, H]
-            
-            # Compute score
-            score = self.path_scorer(
-                torch.cat([curr_state, next_state], dim=-1)
-            )  # [B*T, 1]
-            
-            scores[:, i] = score.view(B, T, 1)
-        
-        return scores
+        return enhanced
 
 class SemanticProcessor(nn.Module):
     def __init__(self, config):
@@ -421,35 +280,48 @@ class SemanticProcessor(nn.Module):
         self.concept_hierarchy = ConceptHierarchy(config)
         self.graph_builder = RelationalGraphBuilder(config)
         
-        # Semantic integration
-        self.semantic_fusion = nn.Sequential(
+        # Enhancement fusion (not replacement)
+        self.semantic_enhancement = nn.Sequential(
             nn.Linear(config.hidden_size * 4, config.hidden_size),
             nn.LayerNorm(config.hidden_size),
             nn.GELU()
         )
+        
+        # Learnable enhancement factor
+        self.enhance_factor = nn.Parameter(torch.tensor(0.15))
+        self.sigmoid = nn.Sigmoid()
     
     def forward(self, x, input_ids, attention_mask=None):
-        # 1. Build concept hierarchy
-        concepts = self.concept_hierarchy(x, input_ids, attention_mask)
+        # Store original input
+        original_x = x
         
-        # 2. Create relational graph
-        edges = self.graph_builder.build_edges(concepts[-1], attention_mask)
+        # 1. Get concepts with proper dimensions
+        concepts, concept_info = self.concept_hierarchy(x, input_ids, attention_mask)
+        concepts = self.concept_proj(concepts)  # Ensure correct dimension
         
-        # 3. Propagate through graph
-        graph_state = self.graph_builder.propagate(
-            concepts[-1], edges, attention_mask
-        )
+        # 2. Build graph with proper dimensions
+        edges, graph_state = self.graph_builder(concepts, attention_mask)
+        graph_state = self.graph_proj(graph_state)  # Ensure correct dimension
         
-        # 4. Integrate all semantic info
-        semantic_state = self.semantic_fusion(torch.cat([
-            x,
-            concepts[0],  # Low-level concepts
-            concepts[-1],  # High-level concepts
-            graph_state
-        ], dim=-1))
+        # Verify dimensions
+        assert original_x.size(-1) == concepts.size(-1) == graph_state.size(-1), \
+            f"Dimension mismatch: {original_x.size(-1)}, {concepts.size(-1)}, {graph_state.size(-1)}"
         
-        return semantic_state, {
-            'concepts': concepts,
+        # Combine all semantic information
+        semantic_features = torch.cat([
+            original_x,    # [batch, seq, hidden]
+            concepts,      # [batch, seq, hidden]
+            graph_state   # [batch, seq, hidden]
+        ], dim=-1)  # Result: [batch, seq, hidden*3]
+        
+        # 4. Generate enhancement with correct output dimension
+        semantic_enhancement = self.semantic_enhancement(semantic_features)  # Back to [batch, seq, hidden]
+        
+        # 5. Small, fixed enhancement
+        enhanced_state = original_x + 0.1 * semantic_enhancement  # Fixed small enhancement
+        
+        return enhanced_state, {
+            'concepts': concept_info,
             'edges': edges,
             'graph_state': graph_state
         }
@@ -485,72 +357,23 @@ class EnhancedReasoning(nn.Module):
             x, input_ids, attention_mask
         )
         
-        # 2. Compute temperatures (importance weights)
+        # 2. Compute temperatures for attention
         temps = self.temperature(torch.cat([
             original_x, semantic_state
         ], dim=-1))
         
-        # 3. Initialize reasoning from semantic state
-        state = semantic_state
-        all_states = []
-        all_validities = []
+        # 3. Apply reasoner
+        reasoned_state = self.reasoner(semantic_state, temps, attention_mask)
         
-        # 4. Iterative reasoning
-        max_steps = 5
-        min_validity = 0.8
-        
-        for step in range(max_steps):
-            # Generate possible steps
-            steps = self.reasoner.generate_step(
-                state, temps, attention_mask
-            )
-            
-            # Validate steps
-            validities = torch.stack([
-                self.reasoner.validate_step(step, state)
-                for step in steps.unbind(1)
-            ], dim=1)
-            
-            # Select best valid step
-            best_idx = torch.argmax(validities, dim=1)
-            best_step = torch.gather(
-                steps, 1,
-                best_idx.unsqueeze(-1).unsqueeze(-1).expand(
-                    -1, 1, steps.size(2), steps.size(3)
-                )
-            ).squeeze(1)
-            
-            # Accumulate enhancement (not replace)
-            state = state + best_step
-            
-            # Store progress
-            all_states.append(state)
-            all_validities.append(validities)
-            
-            # Check if reasoning is sufficient
-            if validities.mean() > min_validity:
-                break
-        
-        # 5. Combine reasoning steps
-        reasoning_states = torch.stack(all_states, dim=1)
-        reasoning_validities = torch.stack(all_validities, dim=1)
-        
-        # Weight by validities
-        weights = F.softmax(reasoning_validities, dim=1).unsqueeze(-1)
-        reasoned_enhancement = (reasoning_states * weights).sum(1)
-        
-        # Create enhancement (not replacement)
+        # 4. Create enhancement
         enhancement = self.enhancement(
-            torch.cat([original_x, reasoned_enhancement], dim=-1)
+            torch.cat([original_x, reasoned_state], dim=-1)
         )
         
         # Return enhanced state and metadata
         return enhancement, {
             'semantic': semantic_info,
-            'temperatures': temps,
-            'reasoning_states': reasoning_states,
-            'reasoning_validities': reasoning_validities,
-            'num_steps': step + 1
+            'temperatures': temps
         }
 
 class SimpleReasoningLayer(nn.Module):
@@ -571,24 +394,15 @@ class SimpleDTAT(nn.Module):
         self.dtat_processor = SimpleReasoningLayer(config)
         
         # Blend factor - learnable parameter
-        self.alpha = nn.Parameter(torch.tensor(0.2))  # Start with more weight on original
-        self.sigmoid = nn.Sigmoid()  # Keep alpha between 0 and 1
-        
-        # Enhancement projection
-        self.enhancement_proj = nn.Sequential(
-            nn.Linear(config.hidden_size * 2, config.hidden_size),
-            nn.LayerNorm(config.hidden_size),
-            nn.GELU()
-        )
+        self.alpha = nn.Parameter(torch.tensor(0.2))
+        self.sigmoid = nn.Sigmoid()
         
         # Initialize only our new weights
         self.dtat_processor.apply(self._init_weights)
-        self.enhancement_proj.apply(self._init_weights)
         
-        # Count only the new parameters we're adding
+        # Count parameters
         dtat_params = sum(p.numel() for p in self.dtat_processor.parameters())
-        proj_params = sum(p.numel() for p in self.enhancement_proj.parameters())
-        print(f"DTAT enhancement initialized with {dtat_params + proj_params:,} additional parameters")
+        print(f"DTAT enhancement initialized with {dtat_params:,} parameters")
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -597,47 +411,25 @@ class SimpleDTAT(nn.Module):
                 module.bias.data.zero_()
     
     def forward(self, input_ids, attention_mask=None, **kwargs):
-        # Get base model output - keeping original computation path intact
+        # Get base model output
         base_outputs = self.base_model(input_ids, attention_mask=attention_mask, **kwargs)
-        original_hidden_states = base_outputs.last_hidden_state
+        hidden_states = base_outputs.last_hidden_state
         
-        # Get DTAT enhancements
-        dtat_enhanced, reasoning_info = self.dtat_processor(
-            original_hidden_states,
-            input_ids,
-            attention_mask
-        )
+        # Apply DTAT processing
+        enhanced_states = self.dtat_processor(hidden_states, input_ids, attention_mask)
         
-        # Compute dynamic blend factor
+        # Blend with original (controlled enhancement)
         alpha = self.sigmoid(self.alpha)
+        final_states = (1 - alpha) * hidden_states + alpha * enhanced_states
         
-        # Combine original and enhanced states
-        combined = self.enhancement_proj(
-            torch.cat([original_hidden_states, dtat_enhanced], dim=-1)
-        )
-        
-        # Enhanced hidden state = original + enhancement
-        enhanced_hidden_states = original_hidden_states + alpha * combined
-        
-        # Return enhanced outputs while preserving original structure
-        base_outputs.last_hidden_state = enhanced_hidden_states
-        
-        # Store enhancement info for analysis
-        if not hasattr(base_outputs, 'enhancement_info'):
-            base_outputs.enhancement_info = {}
-        base_outputs.enhancement_info.update({
-            'dtat_blend_factor': alpha.item(),
-            'reasoning_steps': reasoning_info
-        })
-        
+        # Return with original structure
+        base_outputs.last_hidden_state = final_states
         return base_outputs
     
     def prepare_inputs_for_generation(self, *args, **kwargs):
-        # Delegate to base model for generation
         return self.base_model.prepare_inputs_for_generation(*args, **kwargs)
     
     def _reorder_cache(self, *args, **kwargs):
-        # Delegate to base model for cache reordering
         return self.base_model._reorder_cache(*args, **kwargs)
     
     @property
