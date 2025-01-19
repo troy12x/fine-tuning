@@ -1,5 +1,6 @@
 ### model
 model_name_or_path: silx-ai/Quasar-1
+use_dtat: true
 
 ### method
 stage: sft
@@ -33,4 +34,3 @@ ddp_timeout: 180000000
 
 report_to: wandb
 run_name: Quasar-1
-
